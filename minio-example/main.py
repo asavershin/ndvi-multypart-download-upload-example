@@ -1,61 +1,50 @@
-import tempfile
-
-import numpy as np
+import os
 import rasterio
+import tempfile
 from minio import Minio
 
-# # Конфигурация Minio
-minio_url = "localhost:9000"
-access_key = "minioadmin"
-secret_key = "minioadmin"
+import rasterio.windows
+
+path_red_tif = "/vsis3/files/red.tif"
+path_nir_tif = "/vsis3/files/nir.tif"
+
+# Установка переменных среды
+os.environ['AWS_ACCESS_KEY_ID'] = 'minioadmin'
+os.environ["AWS_SECRET_ACCESS_KEY"] = 'minioadmin'
+
 bucket_name = "files"
-object_name = "image.tif"
+object_name = "ndvi.tif"
 
-# # Подключение к Minio
-minio_client = Minio(minio_url, access_key=access_key, secret_key=secret_key, secure=False)
-print("Читаем из minio")
+chunk_size = 1024 
 
-ndvi = []
+# Инициализация Minio клиента
+minio_client = Minio('localhost:9000',
+                  access_key='minioadmin',
+                  secret_key='minioadmin',
+                  secure=False)
 
-# Получение данных из Minio
-with tempfile.NamedTemporaryFile(suffix=".tif") as temp_file:
-    minio_client.fget_object(bucket_name, object_name, temp_file.name)
-    with rasterio.open(temp_file.name) as src:
-        print("Читаем каналы")
-        # Чтение каналов RED и NIR
-        red = src.read(3)
-        nir = src.read(5)
-        red_height, red_width = red.shape
-        nir_height, nir_width = nir.shape
-        print(f"RED: высота={red_height}, ширина={red_width}")
-        print(f"NIR: высота={nir_height}, ширина={nir_width}")
-        print("закончили читать каналы")
+with rasterio.Env(AWS_HTTPS='NO', GDAL_DISABLE_READDIR_ON_OPEN='YES', AWS_VIRTUAL_HOSTING=False, AWS_S3_ENDPOINT='localhost:9000'):
+    with rasterio.open(path_red_tif) as red_tif, rasterio.open(path_nir_tif) as nir_tif:
+        profile = red_tif.profile
+        height, width = red_tif.shape
 
-        red = red.astype(float)
-        nir = nir.astype(float)
-        print("Начинаем считать NDVI")
-        # Расчет NDVI
-        ndvi = (nir - red) / (nir + red)
-        ndvi_height, ndvi_width = ndvi.shape
-        print(f"NDVI: высота={ndvi_height}, ширина={ndvi_width}")
-        print("Закончили подсчёт ndvi")
+        print("Создание временного файла")
+        with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+            output_path = temp_file.name
+            print("Начало записи во временный файл")
+            with rasterio.open(output_path, 'w', **profile) as dst_ndvi:
+                for offset_y in range(0, height, chunk_size):
+                    for offset_x in range(0, width, chunk_size):
+                        window = rasterio.windows.Window(offset_x, offset_y, min(chunk_size, width - offset_x), min(chunk_size, height - offset_y))
 
-        print("Меняем метаинформацию")
-        # Получение профиля изображения
-        profile = src.profile
+                        # Чтение красного и ближнего инфракрасного каналов
+                        red_chunk = red_tif.read(window=window)
+                        nir_chunk = nir_tif.read(window=window)
 
-        # Изменение параметров профиля для сохранения NDVI
-        profile.update(dtype=rasterio.float32, count=1)
+                        # Расчет NDVI
+                        ndvi_chunk = (nir_chunk - red_chunk) / (nir_chunk + red_chunk)
+                        dst_ndvi.write(ndvi_chunk, window=window)
+            print("Загрузка временного файла в Minio")
+            minio_client.fput_object(bucket_name, object_name, output_path, content_type='image/tiff')
 
-
-print("Сохраняем файл")
-# Сохранение NDVI в новый файл
-
-with tempfile.NamedTemporaryFile(suffix=".tif") as ndvi_temp_file:
-    with rasterio.open(ndvi_temp_file.name, "w", **profile) as dst:
-        dst.write(ndvi, 1)
-    # Загрузка NDVI обратно в Minio
-    # file_size = os.path.getsize(ndvi_temp_file.name)
-    minio_client.fput_object(bucket_name, "ndvi.tif", ndvi_temp_file.name, content_type="image/tiff")
-
-print("Закончили парсить снимок")
+            
